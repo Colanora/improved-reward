@@ -151,6 +151,7 @@ def score_conditions_shared_probes(
 
     batch_size, channels, height, width = x0.shape
     device = x0.device
+    transformer_dtype = next(transformer.parameters()).dtype
     step_indices = select_probe_indices(
         timesteps,
         use_steps=use_steps,
@@ -175,13 +176,15 @@ def score_conditions_shared_probes(
         eps = probe_bank[step_position]
         xt = make_probe_latents(x0=x0, t_idx=t_idx, eps=eps, mode=settings["probe_mode"])
         xt_flat = xt.reshape(k * batch_size, channels, height, width)
+        xt_flat_model = xt_flat.to(transformer_dtype)
         t_flat = t_idx.repeat(k)
         eps_flat = eps.reshape(k * batch_size, channels, height, width)
         x0_flat = x0.unsqueeze(0).repeat(k, 1, 1, 1, 1).reshape(k * batch_size, channels, height, width)
+        x0_flat_model = x0_flat.to(transformer_dtype)
 
         if use_cfg_probe:
-            neg_pe = neg_prompt_embeds.repeat(k, 1, 1)
-            neg_pp = neg_pooled_prompt_embeds.repeat(k, 1)
+            neg_pe = neg_prompt_embeds.repeat(k, 1, 1).to(transformer_dtype)
+            neg_pp = neg_pooled_prompt_embeds.repeat(k, 1).to(transformer_dtype)
 
         for condition in cond_list:
             prompt_embeds = condition["prompt_embeds"]
@@ -189,19 +192,19 @@ def score_conditions_shared_probes(
             if prompt_embeds.shape[0] != batch_size or pooled_prompt_embeds.shape[0] != batch_size:
                 raise ValueError("All condition embeddings must match the x0 batch size.")
 
-            cond_pe = prompt_embeds.repeat(k, 1, 1)
-            cond_pp = pooled_prompt_embeds.repeat(k, 1)
+            cond_pe = prompt_embeds.repeat(k, 1, 1).to(transformer_dtype)
+            cond_pp = pooled_prompt_embeds.repeat(k, 1).to(transformer_dtype)
 
             if use_cfg_probe:
                 v_uncond = transformer(
-                    hidden_states=xt_flat,
+                    hidden_states=xt_flat_model,
                     timestep=t_flat,
                     encoder_hidden_states=neg_pe,
                     pooled_projections=neg_pp,
                     return_dict=False,
                 )[0]
                 v_cond = transformer(
-                    hidden_states=xt_flat,
+                    hidden_states=xt_flat_model,
                     timestep=t_flat,
                     encoder_hidden_states=cond_pe,
                     pooled_projections=cond_pp,
@@ -210,15 +213,15 @@ def score_conditions_shared_probes(
                 v_pred_flat = v_uncond + guidance_scale * (v_cond - v_uncond)
             else:
                 v_pred_flat = transformer(
-                    hidden_states=xt_flat,
+                    hidden_states=xt_flat_model,
                     timestep=t_flat,
                     encoder_hidden_states=cond_pe,
                     pooled_projections=cond_pp,
                     return_dict=False,
                 )[0]
 
-            eps_hat_flat = v_pred_flat + x0_flat
-            mse_flat = torch.mean((eps_hat_flat - eps_flat) ** 2, dim=(1, 2, 3))
+            eps_hat_flat = v_pred_flat + x0_flat_model
+            mse_flat = torch.mean((eps_hat_flat.float() - eps_flat.float()) ** 2, dim=(1, 2, 3))
             mse = mse_flat.view(k, batch_size).mean(dim=0)
             raw_step = -torch.log(mse + delta)
             raw_per_step_lists[condition["name"]].append(raw_step)

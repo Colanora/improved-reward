@@ -6,6 +6,11 @@
 
 set -euo pipefail
 
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export PADDLE_PDX_MODEL_SOURCE="${PADDLE_PDX_MODEL_SOURCE:-huggingface}"
+export PADDLE_PDX_HUGGING_FACE_ENDPOINT="${PADDLE_PDX_HUGGING_FACE_ENDPOINT:-$HF_ENDPOINT}"
+export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK="${PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK:-True}"
+
 SCORE_TYPE=${1:-cope}
 CONFIG_NAME=${2:-config/counterfactual.py:sd3_cf_rerank_2gpu}
 NUM_CANDIDATES=${3:-8}

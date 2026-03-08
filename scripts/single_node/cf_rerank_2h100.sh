@@ -7,6 +7,18 @@
 
 set -euo pipefail
 
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export PADDLE_PDX_MODEL_SOURCE="${PADDLE_PDX_MODEL_SOURCE:-huggingface}"
+export PADDLE_PDX_HUGGING_FACE_ENDPOINT="${PADDLE_PDX_HUGGING_FACE_ENDPOINT:-$HF_ENDPOINT}"
+export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK="${PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK:-True}"
+
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  NVJITLINK_DIR="${CONDA_PREFIX}/lib/python3.12/site-packages/nvidia/cu13/lib"
+  if [ -f "${NVJITLINK_DIR}/libnvJitLink.so.13" ]; then
+    export LD_LIBRARY_PATH="${NVJITLINK_DIR}:${LD_LIBRARY_PATH:-}"
+  fi
+fi
+
 SCORE_TYPE=${1:-cope}
 CONFIG_NAME=${2:-config/counterfactual.py:sd3_cf_rerank_2gpu}
 NUM_CANDIDATES=${3:-8}
@@ -15,6 +27,17 @@ MAIN_PROCESS_PORT=${5:-29610}
 NUM_NEGATIVES=${6:-}
 NEGATIVE_MODE=${7:-auto}
 MAX_PROMPTS=${8:-0}
+DISABLE_METRICS=${CF_DISABLE_METRICS:-0}
+SEED_OVERRIDE=${CF_SEED:-}
+EXTRA_ARGS=()
+
+if [ "${DISABLE_METRICS}" = "1" ]; then
+  EXTRA_ARGS+=(--disable_metrics)
+fi
+
+if [ -n "${SEED_OVERRIDE}" ]; then
+  EXTRA_ARGS+=(--seed="${SEED_OVERRIDE}")
+fi
 
 case "${SCORE_TYPE}" in
   raw|pmi|cope)
@@ -44,4 +67,5 @@ accelerate launch \
   --num_negatives=${NUM_NEGATIVES} \
   --negative_mode=${NEGATIVE_MODE} \
   --max_prompts=${MAX_PROMPTS} \
-  --output_dir=${OUTPUT_DIR}
+  --output_dir=${OUTPUT_DIR} \
+  "${EXTRA_ARGS[@]}"

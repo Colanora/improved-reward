@@ -1,6 +1,9 @@
 import datetime
 import json
 import os
+import sys
+from collections import defaultdict
+from statistics import mean
 
 from absl import app, flags
 from accelerate import Accelerator
@@ -8,6 +11,10 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from ml_collections import config_flags
 import torch
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # pragma: no cover
+    SummaryWriter = None
 
 import solace.rewards
 from solace.counterfactual_sd3_utils import (
@@ -33,6 +40,10 @@ flags.DEFINE_string("negative_mode", None, "Optional negative mode override: aut
 flags.DEFINE_integer("num_negatives", None, "Optional negative-count override.")
 flags.DEFINE_integer("max_prompts", None, "Optional prompt limit override.")
 flags.DEFINE_integer("seed_stride", None, "Optional per-prompt seed stride override.")
+flags.DEFINE_integer("seed", None, "Optional base seed override.")
+flags.DEFINE_bool("disable_metrics", False, "Skip OCR/auxiliary metric initialization and scoring.")
+flags.DEFINE_integer("log_every", 1, "Log progress to terminal every N local prompts on rank 0.")
+flags.DEFINE_bool("tensorboard", True, "Write TensorBoard logs to <run_dir>/tensorboard.")
 flags.DEFINE_string("output_dir", None, "Optional output directory override.")
 logger = get_logger(__name__)
 
@@ -43,6 +54,58 @@ def _selected_index(scores: torch.Tensor) -> int:
 
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
+
+def _mean_selected_metric(rows, method_name, metric_name):
+    values = []
+    for row in rows:
+        method_metrics = row.get("selected_metrics", {}).get(method_name, {})
+        if metric_name in method_metrics:
+            values.append(float(method_metrics[metric_name]))
+    return mean(values) if values else None
+
+
+def _mean_score(rows, score_name):
+    values = []
+    for row in rows:
+        score_values = row.get("scores", {}).get(score_name)
+        if score_values:
+            values.extend(float(value) for value in score_values)
+    return mean(values) if values else None
+
+
+def _counterfactual_accuracy(rows):
+    values = []
+    for row in rows:
+        cope_scores = row.get("scores", {}).get("cope")
+        if not cope_scores:
+            continue
+        selected_index = row.get("selected_index", {}).get("cope", 0)
+        values.append(1.0 if float(cope_scores[selected_index]) > 0 else 0.0)
+    return mean(values) if values else None
+
+
+def _summarize_rows(rows):
+    summary = {
+        "num_prompts": len(rows),
+        "counterfactual_discrimination_accuracy": _counterfactual_accuracy(rows),
+        "mean_raw_score": _mean_score(rows, "raw"),
+        "mean_pmi_score": _mean_score(rows, "pmi"),
+        "mean_cope_score": _mean_score(rows, "cope"),
+        "mean_cope_lse_score": _mean_score(rows, "cope_lse"),
+    }
+
+    metric_names = set()
+    for row in rows:
+        metric_names.update(row.get("metrics", {}).keys())
+
+    for metric_name in sorted(metric_names):
+        for method_name in ["single", "raw", "pmi", "cope", "cope_lse", "primary"]:
+            metric_value = _mean_selected_metric(rows, method_name, metric_name)
+            if metric_value is not None:
+                summary[f"{method_name}_{metric_name}"] = metric_value
+
+    return summary
 
 
 def main(_):
@@ -66,6 +129,10 @@ def main(_):
         config.cf.max_prompts = FLAGS.max_prompts
     if FLAGS.seed_stride is not None:
         config.cf.seed_stride = FLAGS.seed_stride
+    if FLAGS.seed is not None:
+        config.seed = FLAGS.seed
+    if FLAGS.disable_metrics:
+        config.cf.metrics = []
     if FLAGS.output_dir is not None:
         config.output_dir = FLAGS.output_dir
 
@@ -77,9 +144,20 @@ def main(_):
     prompt_dir_root = os.path.join(run_dir, "prompts")
     _ensure_dir(prompt_dir_root)
     rank_results_path = os.path.join(run_dir, f"results_rank{accelerator.process_index}.jsonl")
+    tensorboard_dir = os.path.join(run_dir, "tensorboard")
 
     set_seed(config.seed, device_specific=True)
     logger.info("%s", config)
+
+    writer = None
+    if accelerator.is_main_process and FLAGS.tensorboard:
+        if SummaryWriter is None:
+            logger.warning("TensorBoard logging requested, but tensorboard is not installed.")
+        else:
+            writer = SummaryWriter(log_dir=tensorboard_dir)
+            writer.add_text("config", f"```\n{config}\n```", 0)
+            writer.add_text("command", " ".join(sys.argv), 0)
+            logger.info("TensorBoard logdir: %s", tensorboard_dir)
 
     pipeline, text_encoders, tokenizers = load_sd3_pipeline(
         config=config,
@@ -97,7 +175,18 @@ def main(_):
     metric_fn = None
     if getattr(config.cf, "metrics", None):
         score_dict = {metric_name: 1.0 for metric_name in config.cf.metrics}
-        metric_fn = getattr(solace.rewards, "multi_score")(device, score_dict)
+        try:
+            metric_fn = getattr(solace.rewards, "multi_score")(device, score_dict)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to initialize reranking metrics. "
+                "Install the required OCR/metric dependencies or rerun with --disable_metrics."
+            ) from exc
+
+    local_prompt_count = len(local_prompts)
+    local_processed = 0
+    running_selected_scores = defaultdict(list)
+    running_selected_metrics = defaultdict(list)
 
     for prompt_index, prompt in local_prompts:
         prompt_output_dir = os.path.join(prompt_dir_root, f"{prompt_index:05d}")
@@ -152,7 +241,8 @@ def main(_):
             "cope": _selected_index(score_map["cope"]) if "cope" in score_map else 0,
             "cope_lse": _selected_index(score_map["cope_lse"]) if "cope_lse" in score_map else 0,
         }
-        selected["primary"] = selected.get(config.cf.score_type, selected["single"])
+        primary_method = config.cf.score_type if config.cf.score_type in selected else "single"
+        selected["primary"] = selected[primary_method]
 
         candidate_image_paths = []
         candidate_latent_paths = []
@@ -201,6 +291,49 @@ def main(_):
         }
         write_jsonl_row(rank_results_path, row)
 
+        local_processed += 1
+        if accelerator.is_main_process:
+            for method_name, candidate_index in selected.items():
+                if method_name in score_map:
+                    selected_score = float(score_map[method_name][candidate_index].item())
+                    running_selected_scores[method_name].append(selected_score)
+                    if writer is not None:
+                        writer.add_scalar(f"selected_score/{method_name}", selected_score, local_processed)
+
+            for method_name, metric_dict in selected_metrics.items():
+                for metric_name, metric_value in metric_dict.items():
+                    running_selected_metrics[f"{method_name}_{metric_name}"].append(metric_value)
+                    if writer is not None:
+                        writer.add_scalar(f"selected_metric/{method_name}/{metric_name}", metric_value, local_processed)
+
+            primary_score = None
+            if primary_method in score_map:
+                primary_score = float(score_map[primary_method][selected[primary_method]].item())
+                if writer is not None:
+                    writer.add_scalar("selected_score/primary", primary_score, local_processed)
+
+            if writer is not None:
+                writer.add_scalar("progress/local_prompts_processed", local_processed, local_processed)
+
+            if FLAGS.log_every > 0 and local_processed % FLAGS.log_every == 0:
+                metric_suffix = ""
+                if primary_method in selected_metrics and selected_metrics[primary_method]:
+                    metric_suffix = " | " + " ".join(
+                        f"{metric_name}={metric_value:.4f}"
+                        for metric_name, metric_value in selected_metrics[primary_method].items()
+                    )
+                logger.info(
+                    "Prompt %d/%d | idx=%d | mode=%s | primary=%s | score=%.4f%s | prompt=%s",
+                    local_processed,
+                    local_prompt_count,
+                    prompt_index,
+                    score_result["negative_mode"],
+                    primary_method,
+                    primary_score if primary_score is not None else float("nan"),
+                    metric_suffix,
+                    prompt[:160],
+                )
+
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
@@ -227,6 +360,21 @@ def main(_):
         }
         with open(os.path.join(run_dir, "run_metadata.json"), "w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2)
+
+        rows = []
+        with open(merged_path, "r", encoding="utf-8") as handle:
+            rows.extend(json.loads(line) for line in handle if line.strip())
+        summary = _summarize_rows(rows)
+        with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2)
+
+        logger.info("Run summary: %s", json.dumps(summary, indent=2))
+        if writer is not None:
+            for key, value in summary.items():
+                if isinstance(value, (int, float)) and value is not None:
+                    writer.add_scalar(f"summary/{key}", value, 0)
+            writer.flush()
+            writer.close()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,11 @@
 
 set -euo pipefail
 
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export PADDLE_PDX_MODEL_SOURCE="${PADDLE_PDX_MODEL_SOURCE:-huggingface}"
+export PADDLE_PDX_HUGGING_FACE_ENDPOINT="${PADDLE_PDX_HUGGING_FACE_ENDPOINT:-$HF_ENDPOINT}"
+export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK="${PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK:-True}"
+
 if [ $# -lt 1 ]; then
   echo "Usage: bash scripts/single_node/cf_dpo_2h100.sh <pairs_jsonl> [val_pairs_jsonl] [config_name] [output_dir] [main_process_port]" >&2
   exit 1

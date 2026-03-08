@@ -1,10 +1,30 @@
-import imp
+import importlib.util
 import os
 
 import ml_collections
 
 
-base = imp.load_source("base", os.path.join(os.path.dirname(__file__), "base.py"))
+def _load_base_module():
+    base_path = os.path.join(os.path.dirname(__file__), "base.py")
+    spec = importlib.util.spec_from_file_location("solace_counterfactual_base", base_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load config base module from {base_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+base = _load_base_module()
+
+
+def get_config(config_string: str = ""):
+    if not config_string:
+        return sd3_cf_rerank_2gpu()
+
+    config_fn = globals().get(config_string)
+    if config_fn is None or not callable(config_fn):
+        raise ValueError(f"Unknown counterfactual config: {config_string}")
+    return config_fn()
 
 
 def sd3_cf_rerank_2gpu():
@@ -47,6 +67,20 @@ def sd3_cf_structured_rerank_2gpu():
     config.dataset = os.path.join(os.getcwd(), "dataset/cf_structured")
     config.cf.metrics = []
     config.output_dir = "logs/cf_rerank_sd3_structured"
+    return config
+
+
+def sd3_cf_rerank_2gpu_fp16():
+    config = sd3_cf_rerank_2gpu()
+    config.mixed_precision = "fp16"
+    config.output_dir = "logs/cf_rerank_sd3_fp16"
+    return config
+
+
+def sd3_cf_structured_rerank_2gpu_fp16():
+    config = sd3_cf_structured_rerank_2gpu()
+    config.mixed_precision = "fp16"
+    config.output_dir = "logs/cf_rerank_sd3_structured_fp16"
     return config
 
 

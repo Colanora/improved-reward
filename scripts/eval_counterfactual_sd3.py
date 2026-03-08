@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+from collections import Counter
 from statistics import mean
 
 from absl import app, flags
@@ -55,6 +56,45 @@ def _counterfactual_accuracy(rows):
     return mean(values) if values else None
 
 
+def _selection_disagreement(rows, method_a, method_b):
+    return sum(
+        row.get("selected_index", {}).get(method_a) != row.get("selected_index", {}).get(method_b)
+        for row in rows
+    )
+
+
+def _cross_eval_mean(rows, method_name, score_name):
+    values = []
+    for row in rows:
+        idx = row.get("selected_index", {}).get(method_name)
+        if idx is None:
+            continue
+        score_values = row.get("scores", {}).get(score_name)
+        if score_values is None:
+            continue
+        values.append(float(score_values[idx]))
+    return mean(values) if values else None
+
+
+def _positive_cope_margin(rows, method_name):
+    values = []
+    for row in rows:
+        idx = row.get("selected_index", {}).get(method_name)
+        if idx is None:
+            continue
+        cope_scores = row.get("scores", {}).get("cope")
+        if cope_scores is None:
+            continue
+        values.append(float(cope_scores[idx]) > 0)
+    if not values:
+        return None
+    return {
+        "count": int(sum(values)),
+        "total": len(values),
+        "rate": float(sum(values) / len(values)),
+    }
+
+
 def main(_):
     if not FLAGS.input:
         raise ValueError("--input is required.")
@@ -71,6 +111,35 @@ def main(_):
         "mean_cope_score": _mean_score_margin(rows, "cope"),
         "mean_cope_lse_score": _mean_score_margin(rows, "cope_lse"),
     }
+
+    methods = ["single", "raw", "pmi", "cope", "cope_lse"]
+    score_names = ["raw", "pmi", "cope", "cope_lse"]
+
+    summary["negative_mode_counts"] = dict(
+        Counter(row.get("negative_mode", "unknown") for row in rows)
+    )
+    summary["selection_disagreement"] = {}
+    for index, method_a in enumerate(methods):
+        for method_b in methods[index + 1:]:
+            summary["selection_disagreement"][f"{method_a}_vs_{method_b}"] = _selection_disagreement(
+                rows,
+                method_a,
+                method_b,
+            )
+
+    summary["cross_eval_mean"] = {}
+    for score_name in score_names:
+        summary["cross_eval_mean"][score_name] = {}
+        for method_name in methods:
+            value = _cross_eval_mean(rows, method_name, score_name)
+            if value is not None:
+                summary["cross_eval_mean"][score_name][method_name] = value
+
+    summary["positive_cope_margin"] = {}
+    for method_name in methods:
+        result = _positive_cope_margin(rows, method_name)
+        if result is not None:
+            summary["positive_cope_margin"][method_name] = result
 
     metric_names = set()
     for row in rows:

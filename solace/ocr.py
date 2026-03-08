@@ -1,3 +1,13 @@
+import inspect
+import os
+
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "huggingface")
+os.environ.setdefault(
+    "PADDLE_PDX_HUGGING_FACE_ENDPOINT",
+    os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"),
+)
+
 from paddleocr import PaddleOCR
 import torch
 import numpy as np
@@ -5,18 +15,40 @@ from Levenshtein import distance
 from typing import List, Union, Tuple
 from PIL import Image
 
+
+def _build_paddle_ocr(use_gpu: bool = False):
+    signature = inspect.signature(PaddleOCR.__init__)
+    params = signature.parameters
+    kwargs = {"lang": "en"}
+
+    if "use_angle_cls" in params:
+        kwargs["use_angle_cls"] = False
+    if "use_doc_orientation_classify" in params:
+        kwargs["use_doc_orientation_classify"] = False
+    if "show_log" in params:
+        kwargs["show_log"] = False
+    if "use_gpu" in params:
+        kwargs["use_gpu"] = use_gpu
+    else:
+        kwargs["device"] = "gpu:0" if use_gpu else "cpu"
+
+    try:
+        return PaddleOCR(**kwargs)
+    except ModuleNotFoundError as exc:
+        if exc.name == "paddle":
+            raise ImportError(
+                "PaddleOCR requires the `paddlepaddle` runtime in this environment. "
+                "Install it or run reranking with metrics disabled."
+            ) from exc
+        raise
+
 class OcrScorer:
     def __init__(self, use_gpu: bool = False):
         """
         OCR reward calculator
         :param use_gpu: Whether to use GPU acceleration for PaddleOCR
         """
-        self.ocr = PaddleOCR(
-            use_angle_cls=False,
-            lang="en",
-            use_gpu=use_gpu,
-            show_log=False  # Disable unnecessary log output
-        )
+        self.ocr = _build_paddle_ocr(use_gpu=use_gpu)
 
     @torch.no_grad()
     def __call__(self, 
@@ -68,12 +100,7 @@ class OcrScorer_video_or_image:
         OCR reward calculator
         :param use_gpu: Whether to use GPU acceleration for PaddleOCR
         """
-        self.ocr = PaddleOCR(
-            use_angle_cls=False,
-            lang="en",
-            use_gpu=use_gpu,
-            show_log=False  # Disable unnecessary log output
-        )
+        self.ocr = _build_paddle_ocr(use_gpu=use_gpu)
         self.frame_interval = 4
 
     @torch.no_grad()

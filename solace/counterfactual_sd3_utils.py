@@ -62,7 +62,7 @@ def load_sd3_pipeline(config, device, is_local_main_process: bool = True):
     pipeline.text_encoder.to(device, dtype=inference_dtype)
     pipeline.text_encoder_2.to(device, dtype=inference_dtype)
     pipeline.text_encoder_3.to(device, dtype=inference_dtype)
-    pipeline.transformer.to(device)
+    pipeline.transformer.to(device, dtype=inference_dtype)
 
     text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
     tokenizers = [pipeline.tokenizer, pipeline.tokenizer_2, pipeline.tokenizer_3]

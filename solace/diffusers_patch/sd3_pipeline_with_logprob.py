@@ -140,15 +140,17 @@ def pipeline_with_logprob(
             if self.interrupt:
                 continue
 
+            transformer_dtype = next(self.transformer.parameters()).dtype
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+            latent_model_input = latent_model_input.to(dtype=transformer_dtype)
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
             timestep = t.expand(latent_model_input.shape[0])
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_prompt_embeds,
+                encoder_hidden_states=prompt_embeds.to(dtype=transformer_dtype),
+                pooled_projections=pooled_prompt_embeds.to(dtype=transformer_dtype),
                 joint_attention_kwargs=self.joint_attention_kwargs,
                 return_dict=False,
             )[0]
