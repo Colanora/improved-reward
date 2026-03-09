@@ -230,6 +230,107 @@ def general_ocr_sd3_1gpu():
     return config
 
 
+def general_ocr_sd3_grpo_compare_1gpu_base():
+    config = general_ocr_sd3_1gpu()
+    config.logdir = "logs/grpo_compare_sd3_1gpu"
+    config.save_dir = ""
+    config.logging_backend = "tensorboard"
+    config.activation_checkpointing = True
+    config.run_name = "sd3_grpo_compare_1gpu"
+    config.cf.score_type = "raw"
+    config.cf.negative_mode = "auto"
+    config.cf.num_negatives = 1
+    config.cf.num_probe_steps = 5
+    config.cf.shared_probes = True
+    config.cf.use_cfg_probe = False
+    config.cf.normalize_per_step = True
+    config.cf.time_weighting = "mid"
+    config.cf.k = 8
+    config.cf.delta = 1e-6
+    return config
+
+
+def general_ocr_sd3_grpo_raw_1gpu():
+    config = general_ocr_sd3_grpo_compare_1gpu_base()
+    config.run_name = "sd3_grpo_raw_1gpu"
+    config.cf.score_type = "raw"
+    return config
+
+
+def general_ocr_sd3_grpo_cope_lse_1gpu():
+    config = general_ocr_sd3_grpo_compare_1gpu_base()
+    config.run_name = "sd3_grpo_cope_lse_1gpu"
+    config.cf.score_type = "cope_lse"
+    config.cf.num_negatives = 4
+    return config
+
+
+def general_ocr_sd3_grpo_compare_1gpu_fit80g_base():
+    config = general_ocr_sd3_grpo_compare_1gpu_base()
+    config.run_name = "sd3_grpo_compare_1gpu_fit80g"
+
+    # Keep the same 64 samples/epoch and effective train batch size as the
+    # original 1-GPU recipe, but halve the per-step activation footprint.
+    config.sample.train_batch_size = 4
+    config.sample.num_image_per_prompt = 4
+    config.sample.num_batches_per_epoch = 16
+    config.sample.test_batch_size = 8
+
+    config.train.batch_size = config.sample.train_batch_size
+    config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch // 2
+    return config
+
+
+def general_ocr_sd3_grpo_raw_1gpu_fit80g():
+    config = general_ocr_sd3_grpo_compare_1gpu_fit80g_base()
+    config.run_name = "sd3_grpo_raw_1gpu_fit80g"
+    config.cf.score_type = "raw"
+    return config
+
+
+def general_ocr_sd3_grpo_cope_lse_1gpu_fit80g():
+    config = general_ocr_sd3_grpo_compare_1gpu_fit80g_base()
+    config.run_name = "sd3_grpo_cope_lse_1gpu_fit80g"
+    config.cf.score_type = "cope_lse"
+    config.cf.num_negatives = 4
+    return config
+
+
+def general_ocr_sd3_grpo_compare_1gpu_pilot_base():
+    config = general_ocr_sd3_grpo_compare_1gpu_base()
+    config.run_name = "sd3_grpo_compare_1gpu_pilot"
+    config.num_epochs = 30
+    config.eval_freq = 10
+    config.save_freq = 20
+
+    config.sample.train_batch_size = 8
+    config.sample.num_image_per_prompt = 4
+    config.sample.num_batches_per_epoch = 4
+    config.sample.test_batch_size = 8
+    config.sample.eval_num_steps = 20
+
+    config.train.batch_size = config.sample.train_batch_size
+    config.train.gradient_accumulation_steps = 2
+
+    config.cf.num_negatives = 1
+    return config
+
+
+def general_ocr_sd3_grpo_raw_1gpu_pilot():
+    config = general_ocr_sd3_grpo_compare_1gpu_pilot_base()
+    config.run_name = "sd3_grpo_raw_1gpu_pilot"
+    config.cf.score_type = "raw"
+    return config
+
+
+def general_ocr_sd3_grpo_cope_lse_1gpu_pilot():
+    config = general_ocr_sd3_grpo_compare_1gpu_pilot_base()
+    config.run_name = "sd3_grpo_cope_lse_1gpu_pilot"
+    config.cf.score_type = "cope_lse"
+    config.cf.num_negatives = 4
+    return config
+
+
 def general_ocr_sd3_L_8gpu():
     """SD3.5-Large on 8 GPUs."""
     gpu_number = 8

@@ -2,6 +2,7 @@ from collections import defaultdict
 import contextlib
 import os
 import datetime
+import inspect
 from concurrent import futures
 import time
 import json
@@ -21,18 +22,27 @@ from solace.stat_tracking import PerPromptStatTracker
 from solace.diffusers_patch.sd3_pipeline_with_logprob import pipeline_with_logprob
 from solace.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
 from solace.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
+from solace.baseline_prompts import build_counterfactuals
+from solace.counterfactual_reward import compute_counterfactual_scores
 import torch
-import wandb
 from functools import partial
 import tqdm
 import tempfile
 from PIL import Image
-from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, PeftModel
+from peft import LoraConfig, get_peft_model, PeftModel
 import random
 from torch.utils.data import Dataset, DataLoader, Sampler
 from solace.ema import EMAModuleWrapper
 
-import contextlib
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -49,6 +59,77 @@ def adapter_off_ctx(m):
     if hasattr(base, "disable_adapter"):          # PEFT PeftModel
         return base.disable_adapter()              # context manager
     return contextlib.nullcontext()                # no-op if not LoRA
+
+
+class ExperimentLogger:
+    def __init__(self, backend, run_dir):
+        self.backend = backend
+        self.run_dir = run_dir
+        self.writer = None
+
+        if backend == "tensorboard":
+            if SummaryWriter is None:
+                raise ImportError("TensorBoard logging requested but `tensorboard` is not installed.")
+            self.writer = SummaryWriter(os.path.join(run_dir, "tensorboard"))
+        elif backend == "wandb":
+            if wandb is None:
+                raise ImportError("W&B logging requested but `wandb` is not installed.")
+            wandb.init(project="solace", dir=run_dir)
+        elif backend != "none":
+            raise ValueError(f"Unsupported logging backend: {backend}")
+
+    def log_scalars(self, metrics, step):
+        if self.backend == "tensorboard":
+            for key, value in metrics.items():
+                if value is None:
+                    continue
+                self.writer.add_scalar(key, value, step)
+        elif self.backend == "wandb":
+            wandb.log(metrics, step=step)
+
+    def log_images(self, tag, images, step, captions=None):
+        if not images:
+            return
+        if self.backend == "tensorboard":
+            image_tensor = torch.stack([image.detach().cpu().float().clamp(0, 1) for image in images], dim=0)
+            self.writer.add_images(tag, image_tensor, step)
+        elif self.backend == "wandb":
+            captions = captions or [None] * len(images)
+            wandb.log(
+                {
+                    tag: [
+                        wandb.Image(
+                            image.detach().cpu().permute(1, 2, 0).numpy(),
+                            caption=caption,
+                        )
+                        for image, caption in zip(images, captions)
+                    ]
+                },
+                step=step,
+            )
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.close()
+
+
+def get_run_dir(config):
+    return os.path.join(config.logdir, config.run_name)
+
+
+def get_grpo_probe_step_indices(num_train_timesteps: int):
+    start = int(num_train_timesteps * 0.5)
+    return list(range(start, num_train_timesteps))
+
+
+def maybe_enable_gradient_checkpointing(module):
+    if hasattr(module, "enable_gradient_checkpointing"):
+        module.enable_gradient_checkpointing()
+        return True
+    if hasattr(module, "gradient_checkpointing_enable"):
+        module.gradient_checkpointing_enable()
+        return True
+    return False
 
 # --------------------- Datasets & Sampler ---------------------
 
@@ -122,6 +203,152 @@ def compute_text_embeddings(prompt, text_encoders, tokenizers, max_sequence_leng
         prompt_embeds = prompt_embeds.to(device)
         pooled_prompt_embeds = pooled_prompt_embeds.to(device)
     return prompt_embeds, pooled_prompt_embeds
+
+
+def build_batched_negative_prompts(prompts, config):
+    prompt_negative_lists = []
+    negative_modes = []
+
+    for prompt in prompts:
+        negatives = build_counterfactuals(
+            prompt,
+            mode=getattr(config.cf, "negative_mode", "auto"),
+            n_neg=max(1, int(getattr(config.cf, "num_negatives", 1))),
+        )
+        prompt_negative_lists.append(negatives)
+        negative_modes.append(getattr(config.cf, "negative_mode", "auto"))
+
+    return prompt_negative_lists, negative_modes
+
+
+def compute_intrinsic_score_map(
+    transformer,
+    prompts,
+    x0,
+    timesteps,
+    prompt_embeds,
+    pooled_prompt_embeds,
+    text_encoders,
+    tokenizers,
+    neg_prompt_embed,
+    neg_pooled_prompt_embed,
+    config,
+    device,
+    use_steps,
+    autocast_ctx,
+):
+    batch_size = x0.shape[0]
+    score_type = getattr(config.cf, "score_type", "raw")
+    score_buffers = {}
+    selected_per_step = None
+
+    with torch.no_grad():
+        if score_type == "raw":
+            raw_score, raw_norm_per_step, _ = sds_self_confidence_scalar(
+                transformer=transformer,
+                x0=x0,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                neg_prompt_embed=neg_prompt_embed,
+                neg_pooled_prompt_embed=neg_pooled_prompt_embed,
+                config=config,
+                device=device,
+                autocast_ctx=autocast_ctx,
+                use_steps=use_steps,
+            )
+            score_buffers["raw"] = raw_score
+            selected_score = score_buffers["raw"]
+            selected_per_step = raw_norm_per_step
+            negative_modes = ["raw"] * batch_size
+        elif score_type == "pmi":
+            unconditional_prompt_embeds = neg_prompt_embed.repeat(batch_size, 1, 1)
+            unconditional_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(batch_size, 1)
+            score_result = compute_counterfactual_scores(
+                transformer=transformer,
+                x0=x0,
+                timesteps=timesteps,
+                positive_prompt_embeds=prompt_embeds,
+                positive_pooled_prompt_embeds=pooled_prompt_embeds,
+                unconditional_prompt_embeds=unconditional_prompt_embeds,
+                unconditional_pooled_prompt_embeds=unconditional_pooled_prompt_embeds,
+                config=config,
+                use_steps=use_steps,
+                probe_neg_prompt_embeds=unconditional_prompt_embeds,
+                probe_neg_pooled_prompt_embeds=unconditional_pooled_prompt_embeds,
+            )
+            for key in ("raw", "pmi"):
+                score_buffers[key] = score_result["scores"][key]
+            selected_score = score_buffers["pmi"]
+            selected_per_step = score_result["normalized_per_step"]["positive"]
+            negative_modes = ["unconditional"] * batch_size
+        else:
+            prompt_negative_lists, negative_modes = build_batched_negative_prompts(prompts, config)
+            grouped_indices = defaultdict(list)
+            for index, negatives in enumerate(prompt_negative_lists):
+                grouped_indices[len(negatives)].append(index)
+
+            score_buffers = defaultdict(lambda: torch.empty(batch_size, device=device, dtype=torch.float32))
+            for _, indices in grouped_indices.items():
+                index_tensor = torch.as_tensor(indices, device=device, dtype=torch.long)
+                subgroup_size = len(indices)
+                unconditional_prompt_embeds = neg_prompt_embed.repeat(subgroup_size, 1, 1)
+                unconditional_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(subgroup_size, 1)
+
+                negative_prompt_embeds_list = []
+                negative_pooled_prompt_embeds_list = []
+                num_group_negatives = len(prompt_negative_lists[indices[0]])
+                for slot_index in range(num_group_negatives):
+                    slot_prompts = [prompt_negative_lists[index][slot_index] for index in indices]
+                    neg_pe, neg_pp = compute_text_embeddings(
+                        slot_prompts,
+                        text_encoders,
+                        tokenizers,
+                        max_sequence_length=128,
+                        device=device,
+                    )
+                    negative_prompt_embeds_list.append(neg_pe)
+                    negative_pooled_prompt_embeds_list.append(neg_pp)
+
+                score_result = compute_counterfactual_scores(
+                    transformer=transformer,
+                    x0=x0.index_select(0, index_tensor),
+                    timesteps=timesteps.index_select(0, index_tensor),
+                    positive_prompt_embeds=prompt_embeds.index_select(0, index_tensor),
+                    positive_pooled_prompt_embeds=pooled_prompt_embeds.index_select(0, index_tensor),
+                    unconditional_prompt_embeds=unconditional_prompt_embeds,
+                    unconditional_pooled_prompt_embeds=unconditional_pooled_prompt_embeds,
+                    negative_prompt_embeds_list=negative_prompt_embeds_list,
+                    negative_pooled_prompt_embeds_list=negative_pooled_prompt_embeds_list,
+                    config=config,
+                    use_steps=use_steps,
+                    probe_neg_prompt_embeds=unconditional_prompt_embeds,
+                    probe_neg_pooled_prompt_embeds=unconditional_pooled_prompt_embeds,
+                )
+
+                for key in ("raw", "pmi", "cope", "cope_lse"):
+                    if key in score_result["scores"]:
+                        score_buffers[key][index_tensor] = score_result["scores"][key]
+
+                subgroup_selected_per_step = score_result["normalized_per_step"]["positive"]
+                if selected_per_step is None:
+                    selected_per_step = torch.empty(
+                        batch_size,
+                        subgroup_selected_per_step.shape[1],
+                        device=device,
+                        dtype=subgroup_selected_per_step.dtype,
+                    )
+                selected_per_step[index_tensor] = subgroup_selected_per_step
+
+            score_buffers = {key: value for key, value in score_buffers.items()}
+            selected_score = score_buffers[score_type]
+
+    return {
+        "scores": score_buffers,
+        "selected_score": selected_score,
+        "selected_per_step": selected_per_step,
+        "negative_modes": negative_modes,
+    }
 
 def calculate_zero_std_ratio(prompts, gathered_rewards):
     prompt_array = np.array(prompts)
@@ -395,7 +622,8 @@ def eval_sds(pipeline, test_dataloader, text_encoders, tokenizers, config, accel
         ema.copy_temp_to(transformer_trainable_parameters)
 
 def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator,
-         global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+         global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters,
+         experiment_logger):
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
@@ -406,6 +634,8 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
     sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.test_batch_size, 1)
 
     all_rewards = defaultdict(list)
+    all_intrinsic = defaultdict(list)
+    probe_steps = get_grpo_probe_step_indices(num_train_timesteps)
     for test_batch in tqdm(
             test_dataloader,
             desc="Eval: ",
@@ -421,7 +651,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
         with autocast():
             with torch.no_grad():
-                images, _, _ = pipeline_with_logprob(
+                images, latents, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -434,6 +664,28 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     width=config.resolution,
                     noise_level=0,
                 )
+        latents = torch.stack(latents, dim=1)
+        x0 = latents[:, -1]
+        timesteps = pipeline.scheduler.timesteps.repeat(len(prompts), 1).to(accelerator.device)
+        intrinsic_result = compute_intrinsic_score_map(
+            transformer=pipeline.transformer,
+            prompts=prompts,
+            x0=x0,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            text_encoders=text_encoders,
+            tokenizers=tokenizers,
+            neg_prompt_embed=neg_prompt_embed,
+            neg_pooled_prompt_embed=neg_pooled_prompt_embed,
+            config=config,
+            device=accelerator.device,
+            use_steps=num_train_timesteps if config.cf.score_type == "raw" else probe_steps,
+            autocast_ctx=autocast,
+        )
+        for key, value in intrinsic_result["scores"].items():
+            gathered_intrinsic = accelerator.gather(value).cpu().numpy()
+            all_intrinsic[key].append(gathered_intrinsic)
         # external reward
         rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
         time.sleep(0)
@@ -456,32 +708,31 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
         last_batch_rewards_gather[key] = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
 
     all_rewards = {key: np.concatenate(value) for key, value in all_rewards.items()}
-    if accelerator.is_main_process:
+    all_intrinsic = {key: np.concatenate(value) for key, value in all_intrinsic.items()}
+    if accelerator.is_main_process and experiment_logger is not None:
         with tempfile.TemporaryDirectory() as tmpdir:
             num_samples = min(15, len(last_batch_images_gather))
             sample_indices = range(num_samples)
+            image_tensors = []
+            captions = []
             for idx, index in enumerate(sample_indices):
                 image = last_batch_images_gather[index]
                 pil = Image.fromarray((image.transpose(1, 2, 0) * 255).astype(np.uint8))
                 pil = pil.resize((config.resolution, config.resolution))
                 pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
+                image_tensors.append(torch.tensor(image, dtype=torch.float32))
             sampled_prompts = [last_batch_prompts_gather[index] for index in sample_indices]
             sampled_rewards = [{k: last_batch_rewards_gather[k][index] for k in last_batch_rewards_gather} for index in sample_indices]
-            wandb.log(
-                {
-                    "eval_images": [
-                        wandb.Image(
-                            os.path.join(tmpdir, f"{idx}.jpg"),
-                            caption=f"{prompt:.1000} | " + " | ".join(
-                                f"{k}: {v:.2f}" for k, v in reward.items() if v != -10
-                            ),
-                        )
-                        for idx, (prompt, reward) in enumerate(zip(sampled_prompts, sampled_rewards))
-                    ],
-                    **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()},
-                },
-                step=global_step,
-            )
+            for prompt, reward in zip(sampled_prompts, sampled_rewards):
+                captions.append(
+                    f"{prompt:.1000} | "
+                    + " | ".join(f"{k}: {v:.2f}" for k, v in reward.items() if v != -10)
+                )
+            experiment_logger.log_images("eval_images", image_tensors, step=global_step, captions=captions)
+            metrics = {f"eval_reward/{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()}
+            metrics.update({f"eval_intrinsic/{key}": float(np.mean(value)) for key, value in all_intrinsic.items()})
+            metrics["eval_intrinsic/selected"] = float(np.mean(all_intrinsic[config.cf.score_type]))
+            experiment_logger.log_scalars(metrics, step=global_step)
     if config.train.ema:
         ema.copy_temp_to(transformer_trainable_parameters)
 
@@ -496,11 +747,14 @@ def main(_):
         config.run_name = unique_id
     else:
         config.run_name += "_" + unique_id
+    run_dir = get_run_dir(config)
+    if not config.save_dir:
+        config.save_dir = run_dir
 
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
 
     accelerator_config = ProjectConfiguration(
-        project_dir=os.path.join(config.logdir, config.run_name),
+        project_dir=run_dir,
         automatic_checkpoint_naming=True,
         total_limit=config.num_checkpoint_limit,
     )
@@ -509,9 +763,12 @@ def main(_):
         project_config=accelerator_config,
         gradient_accumulation_steps=config.train.gradient_accumulation_steps * max(1, num_train_timesteps),
     )
+    experiment_logger = None
     if accelerator.is_main_process:
-        wandb.init(project="solace")
+        experiment_logger = ExperimentLogger(config.logging_backend, run_dir)
     logger.info(f"\n{config}")
+    if accelerator.is_main_process and config.logging_backend == "tensorboard":
+        logger.info(f"TensorBoard logdir: {os.path.join(run_dir, 'tensorboard')}")
 
     set_seed(config.seed, device_specific=True)
 
@@ -545,6 +802,11 @@ def main(_):
     pipeline.text_encoder_3.to(accelerator.device, dtype=inference_dtype)
     pipeline.transformer.to(accelerator.device)
 
+    if config.activation_checkpointing:
+        enabled = maybe_enable_gradient_checkpointing(pipeline.transformer)
+        if not enabled:
+            logger.warning("activation_checkpointing=True but transformer does not expose a checkpointing API.")
+
     if config.use_lora:
         target_modules = [
             "attn.add_k_proj","attn.add_q_proj","attn.add_v_proj","attn.to_add_out",
@@ -552,7 +814,18 @@ def main(_):
         ]
         transformer_lora_config = LoraConfig(r=32, lora_alpha=64, init_lora_weights="gaussian", target_modules=target_modules)
         if config.train.lora_path:
-            pipeline.transformer = PeftModel.from_pretrained(pipeline.transformer, config.train.lora_path)
+            load_signature = inspect.signature(PeftModel.from_pretrained)
+            if "is_trainable" in load_signature.parameters:
+                pipeline.transformer = PeftModel.from_pretrained(
+                    pipeline.transformer,
+                    config.train.lora_path,
+                    is_trainable=True,
+                )
+            else:
+                pipeline.transformer = PeftModel.from_pretrained(pipeline.transformer, config.train.lora_path)
+                for name, parameter in pipeline.transformer.named_parameters():
+                    if "lora_" in name:
+                        parameter.requires_grad = True
             pipeline.transformer.set_adapter("default")
         else:
             pipeline.transformer = get_peft_model(pipeline.transformer, transformer_lora_config)
@@ -633,11 +906,11 @@ def main(_):
         transformer, optimizer, train_dataloader, test_dataloader
     )
 
-    # --- SDS ONLY: no executor, no reward_fn ---
+    # --- Intrinsic GRPO training ---
     samples_per_epoch = (config.sample.train_batch_size * accelerator.num_processes * config.sample.num_batches_per_epoch)
     total_train_batch_size = (config.train.batch_size * accelerator.num_processes * config.train.gradient_accumulation_steps)
 
-    logger.info("***** Running training (SDS ONLY) *****")
+    logger.info("***** Running training (Intrinsic GRPO) *****")
     logger.info(f"  Sample batch size per device = {config.sample.train_batch_size}")
     logger.info(f"  Train batch size per device  = {config.train.batch_size}")
     logger.info(f"  Grad Accum steps (x timesteps) = {config.train.gradient_accumulation_steps} x {num_train_timesteps}")
@@ -649,7 +922,7 @@ def main(_):
     global_step = 0
     train_iter = iter(train_dataloader)
 
-    while True:
+    while epoch < config.num_epochs:
         # ========== EVAL ==========
         pipeline.transformer.eval()
         if epoch % config.eval_freq == 0:
@@ -657,12 +930,13 @@ def main(_):
                 pipeline, test_dataloader, text_encoders, tokenizers,
                 config, accelerator, global_step,
                 eval_reward_fn, executor, autocast,
-                num_train_timesteps, ema, transformer_trainable_parameters
+                num_train_timesteps, ema, transformer_trainable_parameters,
+                experiment_logger,
             )
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
-        # ========== SAMPLING + SDS (no external calls) ==========
+        # ========== SAMPLING + intrinsic scoring ==========
         pipeline.transformer.eval()
         samples = []
         prompts_last = None
@@ -703,19 +977,25 @@ def main(_):
 
             x0 = latents[:, -1]                           # clean latent from trajectory
 
-            # === SDS ONLY: compute self-certainty scalar per image ===
-            sds_scalar, _, sds_per_step = sds_self_confidence_scalar(
+            score_result = compute_intrinsic_score_map(
                 transformer=pipeline.transformer,
+                prompts=prompts,
                 x0=x0,
                 timesteps=timesteps,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
+                text_encoders=text_encoders,
+                tokenizers=tokenizers,
                 neg_prompt_embed=neg_prompt_embed,
                 neg_pooled_prompt_embed=neg_pooled_prompt_embed,
                 config=config,
                 device=accelerator.device,
+                use_steps=(
+                    num_train_timesteps
+                    if config.cf.score_type == "raw"
+                    else get_grpo_probe_step_indices(num_train_timesteps)
+                ),
                 autocast_ctx=autocast,
-                use_steps=num_train_timesteps,
             )
 
             samples.append(
@@ -727,9 +1007,15 @@ def main(_):
                     "latents": latents[:, :-1],       # latent before t
                     "next_latents": latents[:, 1:],   # latent after t
                     "log_probs": log_probs,
-                    # Wrap to follow the original structure (we'll collate then expand over T)
-                    "rewards": {"avg": sds_scalar},
-                    "sds_per_step": sds_per_step,
+                    "rewards": {
+                        "avg": score_result["selected_score"],
+                        **{
+                            key: value
+                            for key, value in score_result["scores"].items()
+                            if key in {"raw", "pmi", "cope", "cope_lse"}
+                        },
+                    },
+                    "reward_per_step": score_result["selected_per_step"],
                 }
             )
             prompts_last = prompts
@@ -743,34 +1029,21 @@ def main(_):
             for k in samples[0].keys()
         }
 
-        # (Optional) log a grid of last images with their SDS scores
-        if epoch % 10 == 0 and accelerator.is_main_process and images_last is not None:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                num_samples = min(15, len(images_last))
-                sample_indices = random.sample(range(len(images_last)), num_samples)
-                for idx, ii in enumerate(sample_indices):
-                    image = images_last[ii]
-                    pil = Image.fromarray((image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
-                    pil = pil.resize((config.resolution, config.resolution))
-                    pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
-                sampled_prompts = [prompts_last[ii] for ii in sample_indices]
-                sampled_rewards = [samples["rewards"]["avg"][ii].item() for ii in sample_indices]
-                wandb.log(
-                    {
-                        "images": [
-                            wandb.Image(
-                                os.path.join(tmpdir, f"{idx}.jpg"),
-                                caption=f"{prompt:.100} | sds: {avg_reward:.2f}",
-                            )
-                            for idx, (prompt, avg_reward) in enumerate(zip(sampled_prompts, sampled_rewards))
-                        ],
-                    },
-                    step=global_step,
-                )
+        if epoch % 10 == 0 and accelerator.is_main_process and images_last is not None and experiment_logger is not None:
+            num_samples = min(15, len(images_last))
+            sample_indices = random.sample(range(len(images_last)), num_samples)
+            sampled_prompts = [prompts_last[ii] for ii in sample_indices]
+            sampled_rewards = [samples["rewards"]["avg"][ii].item() for ii in sample_indices]
+            experiment_logger.log_images(
+                "train_images",
+                [images_last[ii].detach().cpu() for ii in sample_indices],
+                step=global_step,
+                captions=[f"{prompt:.100} | reward: {avg_reward:.2f}" for prompt, avg_reward in zip(sampled_prompts, sampled_rewards)],
+            )
 
         # Keep original keys for downstream stats
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"].clone()
-        samples["rewards"]["sds_per_step"] = samples["sds_per_step"].clone()
+        samples["rewards"]["reward_per_step"] = samples["reward_per_step"].clone()
         # Expand the scalar reward along time for GRPO
         samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
 
@@ -779,15 +1052,19 @@ def main(_):
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
 
         if accelerator.is_local_main_process:
-            print(f"SDS stats: max ({gathered_rewards['sds_per_step'].max()}) min ({gathered_rewards['sds_per_step'].min()}) mean({gathered_rewards['sds_per_step'].mean()})")
+            print(
+                f"Reward stats: max ({gathered_rewards['reward_per_step'].max()}) "
+                f"min ({gathered_rewards['reward_per_step'].min()}) "
+                f"mean({gathered_rewards['reward_per_step'].mean()})"
+            )
 
-        if accelerator.is_main_process:
-            wandb.log(
-                {"epoch": epoch, **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items()}},
+        if accelerator.is_main_process and experiment_logger is not None:
+            experiment_logger.log_scalars(
+                {"epoch": epoch, **{f"reward/{key}": value.mean() for key, value in gathered_rewards.items()}},
                 step=global_step,
             )
 
-        # Per-prompt stat tracking (on SDS)
+        # Per-prompt stat tracking on the selected intrinsic reward
         if config.per_prompt_stat_tracking:
             prompt_ids_all = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
             prompts_all = pipeline.tokenizer.batch_decode(prompt_ids_all, skip_special_tokens=True)
@@ -795,11 +1072,16 @@ def main(_):
             if accelerator.is_main_process:
                 group_size, trained_prompt_num = stat_tracker.get_stats()
                 zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts_all, gathered_rewards)
-                wandb.log(
-                    {"group_size": group_size, "trained_prompt_num": trained_prompt_num,
-                     "zero_std_ratio": zero_std_ratio, "reward_std_mean": reward_std_mean},
-                    step=global_step,
-                )
+                if experiment_logger is not None:
+                    experiment_logger.log_scalars(
+                        {
+                            "group_size": group_size,
+                            "trained_prompt_num": trained_prompt_num,
+                            "zero_std_ratio": zero_std_ratio,
+                            "reward_std_mean": reward_std_mean,
+                        },
+                        step=global_step,
+                    )
             stat_tracker.clear()
         else:
             advantages = (gathered_rewards['avg'] - gathered_rewards['avg'].mean()) / (gathered_rewards['avg'].std() + 1e-4)
@@ -815,6 +1097,7 @@ def main(_):
 
         del samples["rewards"]
         del samples["prompt_ids"]
+        del samples["reward_per_step"]
 
         # Mask zero-adv examples across T, keep batch divisibility for num_batches
         mask = (samples["advantages"].abs().sum(dim=1) != 0)
@@ -826,8 +1109,8 @@ def main(_):
             if len(false_indices) >= num_to_change:
                 random_indices = torch.randperm(len(false_indices))[:num_to_change]
                 mask[false_indices[random_indices]] = True
-        if accelerator.is_main_process:
-            wandb.log({"actual_batch_size": mask.sum().item() // num_batches}, step=global_step)
+        if accelerator.is_main_process and experiment_logger is not None:
+            experiment_logger.log_scalars({"actual_batch_size": mask.sum().item() // num_batches}, step=global_step)
         samples = {k: v[mask] for k, v in samples.items()}
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
@@ -878,12 +1161,12 @@ def main(_):
                             )
                             if config.train.beta > 0:
                                 with torch.no_grad():
-                                    with transformer.module.disable_adapter():
+                                    with adapter_off_ctx(transformer):
                                         _, _, prev_sample_mean_ref, _ = compute_log_prob(
                                             transformer, pipeline, sample, j, embeds, pooled_embeds, config
                                         )
 
-                        # GRPO with SDS-derived advantages
+                        # GRPO with intrinsic-reward-derived advantages
                         advantages_j = torch.clamp(
                             sample["advantages"][:, j],
                             -config.train.adv_clip_max,
@@ -921,14 +1204,18 @@ def main(_):
                         info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
                         info = accelerator.reduce(info, reduction="mean")
                         info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                        if accelerator.is_main_process:
-                            wandb.log(info, step=global_step)
+                        if accelerator.is_main_process and experiment_logger is not None:
+                            experiment_logger.log_scalars(info, step=global_step)
                         global_step += 1
                         info = defaultdict(list)
                 if config.train.ema:
                     ema.step(transformer_trainable_parameters, global_step)
 
         epoch += 1
+
+    if experiment_logger is not None:
+        experiment_logger.close()
+    executor.shutdown(wait=False)
 
 if __name__ == "__main__":
     app.run(main)

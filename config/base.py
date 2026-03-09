@@ -30,6 +30,7 @@ def get_config():
     config.resolution = 768
     config.activation_checkpointing = False
     config.fsdp_optimizer_offload = False
+    config.logging_backend = "wandb"
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
@@ -120,6 +121,19 @@ def get_config():
     # reward function to use. see `rewards.py` for available reward functions.
     config.reward_fn = ml_collections.ConfigDict()
     config.save_dir = ''
+
+    ###### Counterfactual Intrinsic Reward ######
+    config.cf = cf = ml_collections.ConfigDict()
+    cf.score_type = "raw"
+    cf.negative_mode = "auto"
+    cf.num_negatives = 1
+    cf.num_probe_steps = 5
+    cf.shared_probes = True
+    cf.use_cfg_probe = False
+    cf.normalize_per_step = True
+    cf.time_weighting = "mid"
+    cf.k = 8
+    cf.delta = 1e-6
 
     ###### Per-Prompt Stat Tracking ######
     config.per_prompt_stat_tracking = True
